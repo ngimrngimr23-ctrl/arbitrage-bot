@@ -156,7 +156,11 @@ async def check_markets(session, network):
                             stats['signals'] += 1
                             
                             act = "🚀 ПАМП (5м)" if is_p else ("🩸 ДАМП (5м)" if is_d else "⚠️ ЧАСОВОЙ ДАМП")
-                            id_str = f"<code>{cg_id}</code>" if cg_id else "❌ <i>(Ликвидность)</i>"
+                            id_str = f"<code>{cg_id}</code>" if cg_id else "❌ <i>(Только ликвидность)</i>"
+                            
+                            # Ссылки на CoinGecko
+                            cg_link = f"🦎 <a href='https://www.coingecko.com/en/coins/{cg_id}'>CoinGecko</a>" if cg_id else "🦎 <i>Нет на CG</i>"
+                            gt_link = f"📈 <a href='https://www.geckoterminal.com/{network}/pools/{addr}'>График (GeckoTerminal)</a>"
                             
                             msg = (f"{act} | <b>{network.upper()}</b>\n"
                                    f"Пара: <code>{attrs.get('name')}</code>\n"
@@ -164,7 +168,7 @@ async def check_markets(session, network):
                                    f"Ликвидность: <b>${liq:,.0f}</b>\n\n"
                                    f"5m: <b>{m5}%</b> | 1h: <b>{h1}%</b> | 24h: <b>{h24}%</b>\n\n"
                                    f"Контракт: <code>{addr}</code>\n"
-                                   f"📈 <a href='https://dexscreener.com/{network}/{addr}'>DexScreener</a>")
+                                   f"{cg_link} | {gt_link}")
                             await send_tg(session, msg)
                             await asyncio.sleep(SETTINGS['tg_pause'])
                     except: continue
