@@ -16,21 +16,41 @@ SETTINGS = {
     'cooldown': 3600,      # 1 час молчания для дубликатов
     'api_pause': 2.3,      # Пауза между страницами API
     'tg_pause': 1.5,       # Пауза между сообщениями в ТГ
-    'request_timeout': 15  # Секунд на ожидание ответа от сервера
+    'request_timeout': 15  # Секунд на ожидание ответа
 }
 
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN')
 TG_CHAT_ID = os.environ.get('TG_CHAT_ID')
 
 if not TG_BOT_TOKEN or not TG_CHAT_ID:
-    raise ValueError("❌ КРИТИЧЕСКАЯ ОШИБКА: Проверь переменные окружения в Render!")
+    raise ValueError("❌ КРИТИЧЕСКАЯ ОШИБКА: Проверь переменные окружения!")
 
 TOP_CHAINS = ['eth', 'bsc', 'polygon', 'arbitrum', 'base', 'solana']
 sent_signals = {}
 
+# Словарь для конвертации сетей для прямого API CoinGecko
+CG_NETWORKS = {
+    'eth': 'ethereum', 'bsc': 'binance-smart-chain', 
+    'polygon_pos': 'polygon-pos', 'arbitrum': 'arbitrum-one', 
+    'base': 'base', 'solana': 'solana'
+}
+
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Arbitrage Pro (ID + Liq Filter) Active"
+def home(): return "Arbitrage Pro (ID + Liq + CG API) Active"
+
+async def check_coingecko_listing(session, address, network):
+    """Прямой запрос в CoinGecko (запасной вариант)"""
+    cg_net = CG_NETWORKS.get(network, network)
+    url = f"https://api.coingecko.com/api/v3/coins/{cg_net}/contract/{address}"
+    try:
+        async with session.get(url, timeout=5) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return data.get('id')
+            return None
+    except:
+        return None
 
 async def send_tg(session, text):
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
@@ -42,7 +62,7 @@ async def send_tg(session, text):
                 print(f"⚠️ Ошибка Telegram API: {data.get('description')}")
             return data
     except Exception as e:
-        print(f"❌ Сбой сети при отправке в ТГ: {e}")
+        print(f"❌ Сбой сети ТГ: {e}")
 
 async def get_all_networks(session):
     all_nets = []
@@ -56,9 +76,7 @@ async def get_all_networks(session):
                 for net in data.get('data', []):
                     all_nets.append(net['id'])
             await asyncio.sleep(1)
-        except Exception as e:
-            print(f"⚠️ Ошибка списка сетей: {e}")
-            break
+        except: break
     for top in TOP_CHAINS:
         if top not in all_nets: all_nets.append(top)
     return all_nets
@@ -72,7 +90,7 @@ async def check_markets(session, network):
     
     print(f"\n📡 СКАНИРУЮ: {network.upper()}")
     headers = {'User-Agent': 'Mozilla/5.0'}
-    stats = {'passed': 0, 'trash': 0, 'signals': 0}
+    stats = {'passed': 0, 'trash': 0, 'signals': 0, 'cg_api_hits': 0}
     now = time.time()
     
     for page in range(1, 11):
@@ -92,51 +110,69 @@ async def check_markets(session, network):
                 for p in pools:
                     try:
                         attrs = p.get('attributes', {})
+                        addr = attrs.get('address')
                         t_id = p.get('relationships', {}).get('base_token', {}).get('data', {}).get('id')
                         cg_id = tokens.get(t_id, {}).get('coingecko_coin_id')
-                        
-                        # Достаем ликвидность пула
                         liq = float(attrs.get('reserve_in_usd') or 0)
                         
-                        # НОВАЯ ЛОГИКА ФИЛЬТРА: Есть ID ИЛИ Ликвидность > порога
-                        if not cg_id and liq < min_liq:
-                            stats['trash'] += 1
-                            continue
-                        
-                        stats['passed'] += 1
                         pct = attrs.get('price_change_percentage') or {}
                         m5, h1, h24 = float(pct.get('m5') or 0), float(pct.get('h1') or 0), float(pct.get('h24') or 0)
                         
                         is_p, is_d = m5 >= p_th, m5 <= -d_th
                         is_h1 = (h1 <= -h1_th) and (h24 <= (h1 * 0.8))
+                        is_triggered = is_p or is_d or is_h1
                         
-                        if is_p or is_d or is_h1:
-                            type = "P5" if is_p else ("D5" if is_d else "DH1")
-                            key = f"{network}_{attrs.get('address')}_{type}"
+                        # --- ЛОГИКА ФИЛЬТРАЦИИ ---
+                        if cg_id:
+                            pass # 1. Есть ID от GeckoTerminal -> Пропускаем
+                        elif liq >= min_liq:
+                            pass # 2. Нет ID, но ликвидность высокая -> Пропускаем
+                        else:
+                            # 3. Нет ID, ликвидность низкая. Ждем триггера.
+                            if not is_triggered:
+                                stats['trash'] += 1
+                                continue
+                            
+                            # 4. Произошел ПАМП/ДАМП! Делаем запасной запрос в CoinGecko
+                            print(f"🔍 Прямой запрос в CoinGecko для: {attrs.get('name')} ({addr})")
+                            cg_id = await check_coingecko_listing(session, addr, network)
+                            
+                            if cg_id:
+                                stats['cg_api_hits'] += 1
+                                print(f"✅ Найден скрытый ID: {cg_id}")
+                            else:
+                                stats['trash'] += 1
+                                continue # Если и тут нет - в мусор
+                        
+                        stats['passed'] += 1
+                        
+                        # --- ОТПРАВКА СИГНАЛА ---
+                        if is_triggered:
+                            type_sig = "P5" if is_p else ("D5" if is_d else "DH1")
+                            key = f"{network}_{addr}_{type_sig}"
                             
                             if key in sent_signals and (now - sent_signals[key]) < SETTINGS['cooldown']: continue
-                            
                             sent_signals[key] = now
                             stats['signals'] += 1
-                            act = "🚀 ПАМП (5м)" if is_p else ("🩸 ДАМП (5м)" if is_d else "⚠️ ЧАСОВОЙ ДАМП")
                             
-                            # Формируем строку ID для сообщения
-                            id_str = f"<code>{cg_id}</code>" if cg_id else "❌ <i>Нет (спасен ликвидностью)</i>"
+                            act = "🚀 ПАМП (5м)" if is_p else ("🩸 ДАМП (5м)" if is_d else "⚠️ ЧАСОВОЙ ДАМП")
+                            id_str = f"<code>{cg_id}</code>" if cg_id else "❌ <i>(Ликвидность)</i>"
                             
                             msg = (f"{act} | <b>{network.upper()}</b>\n"
                                    f"Пара: <code>{attrs.get('name')}</code>\n"
                                    f"ID: {id_str}\n"
                                    f"Ликвидность: <b>${liq:,.0f}</b>\n\n"
                                    f"5m: <b>{m5}%</b> | 1h: <b>{h1}%</b> | 24h: <b>{h24}%</b>\n\n"
-                                   f"Контракт: <code>{attrs.get('address')}</code>\n"
-                                   f"📈 <a href='https://dexscreener.com/{network}/{attrs.get('address')}'>DexScreener</a>")
+                                   f"Контракт: <code>{addr}</code>\n"
+                                   f"📈 <a href='https://dexscreener.com/{network}/{addr}'>DexScreener</a>")
                             await send_tg(session, msg)
                             await asyncio.sleep(SETTINGS['tg_pause'])
                     except: continue
             await asyncio.sleep(SETTINGS['api_pause'])
         except Exception as e:
             print(f"❌ Ошибка страницы {page}: {e}"); break
-    print(f"📊 {network}: Прошли фильтр: {stats['passed']} | Мусор: {stats['trash']} | Сигналы: {stats['signals']}")
+            
+    print(f"📊 {network}: Прошли: {stats['passed']} | Мусор: {stats['trash']} | Найдено через API: {stats['cg_api_hits']} | Сигналы: {stats['signals']}")
 
 async def handle_cmds():
     offset = 0
@@ -153,11 +189,11 @@ async def handle_cmds():
                         txt = msg.get('text', '')
                         
                         if txt == '/start':
-                            await send_tg(sess, f"🤖 <b>Pro Scanner (ID + Liq Filter)</b>\n\n"
+                            await send_tg(sess, f"🤖 <b>Pro Scanner (ID + Liq + CG API)</b>\n\n"
                                                f"🏆 ТОП-6 (P/D): <b>{SETTINGS['top_pump']}%</b> / <b>-{SETTINGS['top_dump']}%</b>\n"
                                                f"💎 Редкие (P/D): <b>{SETTINGS['rare_pump']}%</b> / <b>-{SETTINGS['rare_dump']}%</b>\n"
                                                f"⏳ H1 Дамп: <b>-{SETTINGS['h1_dump']}%</b>\n"
-                                               f"💧 Мин. ликвидность (без ID): <b>${SETTINGS['min_liq']:,.0f}</b>\n\n"
+                                               f"💧 Мин. ликвидность: <b>${SETTINGS['min_liq']:,.0f}</b>\n\n"
                                                "<b>Команды:</b>\n"
                                                "/pump_top [ч] | /dump_top [ч]\n"
                                                "/pump_rare [ч] | /dump_rare [ч]\n"
@@ -184,18 +220,19 @@ async def main_loop():
     async with aiohttp.ClientSession(connector=conn) as sess:
         while True:
             nets = await get_all_networks(sess)
-            print(f"\n>>> КРУГ ЗАПУЩЕН ({len(nets)} сетей)")
+            print(f"\n====================================")
+            print(f"🚀 НАЧИНАЮ НОВЫЙ КРУГ ({len(nets)} сетей)")
+            print(f"====================================")
             for n in nets: await check_markets(sess, n)
             
             cur = time.time()
             to_del = [k for k, v in sent_signals.items() if (cur - v) > SETTINGS['cooldown']]
             for k in to_del: del sent_signals[k]
             
-            print("🏁 КРУГ ЗАВЕРШЕН. Сон 30с.")
+            print("🏁 КРУГ ЗАВЕРШЕН. Отдыхаем 30 секунд...")
             await asyncio.sleep(30)
 
 if __name__ == "__main__":
     srv = Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080))), daemon=True)
     srv.start()
     asyncio.run(main_loop())
-    
