@@ -12,7 +12,6 @@ SETTINGS = {
     'rare_pump': 20.0,
     'rare_dump': 20.0,
     'h1_dump': 25.0,
-    'min_liq': 50000.0,    # Минимальная ликвидность ($) для монет БЕЗ ID
     'cooldown': 3600,      # 1 час молчания для дубликатов
     'api_pause': 2.3,      # Пауза между страницами API
     'tg_pause': 1.5,       # Пауза между сообщениями в ТГ
@@ -23,7 +22,7 @@ TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN')
 TG_CHAT_ID = os.environ.get('TG_CHAT_ID')
 
 if not TG_BOT_TOKEN or not TG_CHAT_ID:
-    raise ValueError("❌ КРИТИЧЕСКАЯ ОШИБКА: Проверь переменные окружения!")
+    raise ValueError("❌ КРИТИЧЕСКАЯ ОШИБКА: Проверь переменные окружения (TG_BOT_TOKEN, TG_CHAT_ID)!")
 
 TOP_CHAINS = ['eth', 'bsc', 'polygon', 'arbitrum', 'base', 'solana']
 sent_signals = {}
@@ -37,7 +36,7 @@ CG_NETWORKS = {
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Arbitrage Pro (ID + Liq + CG API) Active"
+def home(): return "Arbitrage Pro (Deep Scan + Trending) Active"
 
 async def check_coingecko_listing(session, address, network):
     """Прямой запрос в CoinGecko (запасной вариант)"""
@@ -86,15 +85,18 @@ async def check_markets(session, network):
     p_th = SETTINGS['top_pump'] if is_top else SETTINGS['rare_pump']
     d_th = SETTINGS['top_dump'] if is_top else SETTINGS['rare_dump']
     h1_th = SETTINGS['h1_dump']
-    min_liq = SETTINGS['min_liq']
     
     print(f"\n📡 СКАНИРУЮ: {network.upper()}")
     headers = {'User-Agent': 'Mozilla/5.0'}
     stats = {'passed': 0, 'trash': 0, 'signals': 0, 'cg_api_hits': 0}
     now = time.time()
+
+    # Сначала проверяем трендовые пулы, затем идем вглубь до 30 страницы
+    urls_to_check = [f"https://api.geckoterminal.com/api/v2/networks/{network}/trending_pools?include=base_token"]
+    for page in range(1, 31): 
+        urls_to_check.append(f"https://api.geckoterminal.com/api/v2/networks/{network}/pools?page={page}&include=base_token")
     
-    for page in range(1, 11):
-        url = f"https://api.geckoterminal.com/api/v2/networks/{network}/pools?page={page}&include=base_token"
+    for url in urls_to_check:
         try:
             async with session.get(url, headers=headers, timeout=SETTINGS['request_timeout']) as resp:
                 if resp.status == 429:
@@ -122,61 +124,59 @@ async def check_markets(session, network):
                         is_h1 = (h1 <= -h1_th) and (h24 <= (h1 * 0.8))
                         is_triggered = is_p or is_d or is_h1
                         
-                        # --- ЛОГИКА ФИЛЬТРАЦИИ ---
-                        if cg_id:
-                            pass # 1. Есть ID от GeckoTerminal -> Пропускаем
-                        elif liq >= min_liq:
-                            pass # 2. Нет ID, но ликвидность высокая -> Пропускаем
-                        else:
-                            # 3. Нет ID, ликвидность низкая. Ждем триггера.
+                        # --- СТРОГАЯ ЛОГИКА ФИЛЬТРАЦИИ ---
+                        if not cg_id:
+                            # Если нет ID, ждем триггера
                             if not is_triggered:
                                 stats['trash'] += 1
                                 continue
                             
-                            # 4. Произошел ПАМП/ДАМП! Делаем запасной запрос в CoinGecko
-                            print(f"🔍 Прямой запрос в CoinGecko для: {attrs.get('name')} ({addr})")
+                            # Произошел ПАМП/ДАМП! Делаем запасной запрос в CoinGecko
                             cg_id = await check_coingecko_listing(session, addr, network)
                             
                             if cg_id:
                                 stats['cg_api_hits'] += 1
-                                print(f"✅ Найден скрытый ID: {cg_id}")
                             else:
                                 stats['trash'] += 1
-                                continue # Если и тут нет - в мусор
+                                continue # Жестко в мусор, ликвидность игнорируем
+                        else:
+                            # Если ID есть сразу, но нет триггера - просто считаем и идем дальше
+                            if not is_triggered:
+                                stats['passed'] += 1
+                                continue
                         
                         stats['passed'] += 1
                         
                         # --- ОТПРАВКА СИГНАЛА ---
-                        if is_triggered:
-                            type_sig = "P5" if is_p else ("D5" if is_d else "DH1")
-                            key = f"{network}_{addr}_{type_sig}"
-                            
-                            if key in sent_signals and (now - sent_signals[key]) < SETTINGS['cooldown']: continue
-                            sent_signals[key] = now
-                            stats['signals'] += 1
-                            
-                            act = "🚀 ПАМП (5м)" if is_p else ("🩸 ДАМП (5м)" if is_d else "⚠️ ЧАСОВОЙ ДАМП")
-                            id_str = f"<code>{cg_id}</code>" if cg_id else "❌ <i>(Только ликвидность)</i>"
-                            
-                            # Ссылки на CoinGecko
-                            cg_link = f"🦎 <a href='https://www.coingecko.com/en/coins/{cg_id}'>CoinGecko</a>" if cg_id else "🦎 <i>Нет на CG</i>"
-                            gt_link = f"📈 <a href='https://www.geckoterminal.com/{network}/pools/{addr}'>График (GeckoTerminal)</a>"
-                            
-                            msg = (f"{act} | <b>{network.upper()}</b>\n"
-                                   f"Пара: <code>{attrs.get('name')}</code>\n"
-                                   f"ID: {id_str}\n"
-                                   f"Ликвидность: <b>${liq:,.0f}</b>\n\n"
-                                   f"5m: <b>{m5}%</b> | 1h: <b>{h1}%</b> | 24h: <b>{h24}%</b>\n\n"
-                                   f"Контракт: <code>{addr}</code>\n"
-                                   f"{cg_link} | {gt_link}")
-                            await send_tg(session, msg)
-                            await asyncio.sleep(SETTINGS['tg_pause'])
+                        type_sig = "P5" if is_p else ("D5" if is_d else "DH1")
+                        key = f"{network}_{addr}_{type_sig}"
+                        
+                        if key in sent_signals and (now - sent_signals[key]) < SETTINGS['cooldown']: continue
+                        sent_signals[key] = now
+                        stats['signals'] += 1
+                        
+                        act = "🚀 ПАМП (5м)" if is_p else ("🩸 ДАМП (5м)" if is_d else "⚠️ ЧАСОВОЙ ДАМП")
+                        
+                        cg_link = f"🦎 <a href='https://www.coingecko.com/en/coins/{cg_id}'>CoinGecko</a>"
+                        gt_link = f"📈 <a href='https://www.geckoterminal.com/{network}/pools/{addr}'>График</a>"
+                        
+                        msg = (f"{act} | <b>{network.upper()}</b>\n"
+                               f"Пара: <code>{attrs.get('name')}</code>\n"
+                               f"ID: <code>{cg_id}</code>\n"
+                               f"Ликвидность: <b>${liq:,.0f}</b>\n\n"
+                               f"5m: <b>{m5}%</b> | 1h: <b>{h1}%</b> | 24h: <b>{h24}%</b>\n\n"
+                               f"Контракт: <code>{addr}</code>\n"
+                               f"{cg_link} | {gt_link}")
+                        await send_tg(session, msg)
+                        await asyncio.sleep(SETTINGS['tg_pause'])
                     except: continue
-            await asyncio.sleep(SETTINGS['api_pause'])
-        except Exception as e:
-            print(f"❌ Ошибка страницы {page}: {e}"); break
             
-    print(f"📊 {network}: Прошли: {stats['passed']} | Мусор: {stats['trash']} | Найдено через API: {stats['cg_api_hits']} | Сигналы: {stats['signals']}")
+            # Пауза 2.5 секунды, чтобы не словить бан при 30 страницах
+            await asyncio.sleep(2.5) 
+        except Exception as e:
+            print(f"❌ Ошибка: {e}"); break
+            
+    print(f"📊 {network}: Проверено (с ID): {stats['passed']} | Мусор (без ID): {stats['trash']} | Найдено через API: {stats['cg_api_hits']} | Сигналы: {stats['signals']}")
 
 async def handle_cmds():
     offset = 0
@@ -193,15 +193,14 @@ async def handle_cmds():
                         txt = msg.get('text', '')
                         
                         if txt == '/start':
-                            await send_tg(sess, f"🤖 <b>Pro Scanner (ID + Liq + CG API)</b>\n\n"
+                            await send_tg(sess, f"🤖 <b>Pro Scanner (Deep Scan + Trending)</b>\n\n"
                                                f"🏆 ТОП-6 (P/D): <b>{SETTINGS['top_pump']}%</b> / <b>-{SETTINGS['top_dump']}%</b>\n"
                                                f"💎 Редкие (P/D): <b>{SETTINGS['rare_pump']}%</b> / <b>-{SETTINGS['rare_dump']}%</b>\n"
-                                               f"⏳ H1 Дамп: <b>-{SETTINGS['h1_dump']}%</b>\n"
-                                               f"💧 Мин. ликвидность: <b>${SETTINGS['min_liq']:,.0f}</b>\n\n"
+                                               f"⏳ H1 Дамп: <b>-{SETTINGS['h1_dump']}%</b>\n\n"
                                                "<b>Команды:</b>\n"
                                                "/pump_top [ч] | /dump_top [ч]\n"
                                                "/pump_rare [ч] | /dump_rare [ч]\n"
-                                               "/dump_h1 [ч] | /min_liq [ч]")
+                                               "/dump_h1 [ч]")
                         elif txt.startswith('/'):
                             parts = txt.split()
                             if len(parts) == 2:
@@ -212,7 +211,6 @@ async def handle_cmds():
                                     elif '/pump_rare' in txt: SETTINGS['rare_pump'] = val
                                     elif '/dump_rare' in txt: SETTINGS['rare_dump'] = val
                                     elif '/dump_h1' in txt: SETTINGS['h1_dump'] = val
-                                    elif '/min_liq' in txt: SETTINGS['min_liq'] = val
                                     await send_tg(sess, f"✅ Обновлено: {val}")
                                 except: pass
             except: pass
@@ -237,6 +235,7 @@ async def main_loop():
             await asyncio.sleep(30)
 
 if __name__ == "__main__":
-    srv = Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080))), daemon=True)
+    port = int(os.environ.get('PORT', 10000))
+    srv = Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True)
     srv.start()
     asyncio.run(main_loop())
