@@ -12,6 +12,7 @@ SETTINGS = {
     'rare_pump': 20.0,
     'rare_dump': 20.0,
     'h1_dump': 25.0,
+    'min_liq': 10000.0,    # ВОЗВРАЩЕН ФИЛЬТР ЛИКВИДНОСТИ ($)
     'cooldown': 3600,      # 1 час молчания для дубликатов
     'api_pause': 2.3,      # Пауза между страницами API
     'tg_pause': 1.5,       # Пауза между сообщениями в ТГ
@@ -27,7 +28,6 @@ if not TG_BOT_TOKEN or not TG_CHAT_ID:
 TOP_CHAINS = ['eth', 'bsc', 'polygon', 'arbitrum', 'base', 'solana']
 sent_signals = {}
 
-# Словарь для конвертации сетей для прямого API CoinGecko
 CG_NETWORKS = {
     'eth': 'ethereum', 'bsc': 'binance-smart-chain', 
     'polygon_pos': 'polygon-pos', 'arbitrum': 'arbitrum-one', 
@@ -36,10 +36,9 @@ CG_NETWORKS = {
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Arbitrage Pro (Deep Scan + Trending) Active"
+def home(): return "Arbitrage Pro (Deep Scan + Trending + Liq Filter) Active"
 
 async def check_coingecko_listing(session, address, network):
-    """Прямой запрос в CoinGecko (запасной вариант)"""
     cg_net = CG_NETWORKS.get(network, network)
     url = f"https://api.coingecko.com/api/v3/coins/{cg_net}/contract/{address}"
     try:
@@ -85,13 +84,13 @@ async def check_markets(session, network):
     p_th = SETTINGS['top_pump'] if is_top else SETTINGS['rare_pump']
     d_th = SETTINGS['top_dump'] if is_top else SETTINGS['rare_dump']
     h1_th = SETTINGS['h1_dump']
+    min_liq = SETTINGS['min_liq']
     
     print(f"\n📡 СКАНИРУЮ: {network.upper()}")
     headers = {'User-Agent': 'Mozilla/5.0'}
     stats = {'passed': 0, 'trash': 0, 'signals': 0, 'cg_api_hits': 0}
     now = time.time()
 
-    # Сначала проверяем трендовые пулы, затем идем вглубь до 30 страницы
     urls_to_check = [f"https://api.geckoterminal.com/api/v2/networks/{network}/trending_pools?include=base_token"]
     for page in range(1, 31): 
         urls_to_check.append(f"https://api.geckoterminal.com/api/v2/networks/{network}/pools?page={page}&include=base_token")
@@ -117,6 +116,11 @@ async def check_markets(session, network):
                         cg_id = tokens.get(t_id, {}).get('coingecko_coin_id')
                         liq = float(attrs.get('reserve_in_usd') or 0)
                         
+                        # --- ПРАВИЛО №1: НЕТ ЛИКВИДНОСТИ = МУСОР ---
+                        if liq < min_liq:
+                            stats['trash'] += 1
+                            continue
+                        
                         pct = attrs.get('price_change_percentage') or {}
                         m5, h1, h24 = float(pct.get('m5') or 0), float(pct.get('h1') or 0), float(pct.get('h24') or 0)
                         
@@ -124,23 +128,19 @@ async def check_markets(session, network):
                         is_h1 = (h1 <= -h1_th) and (h24 <= (h1 * 0.8))
                         is_triggered = is_p or is_d or is_h1
                         
-                        # --- СТРОГАЯ ЛОГИКА ФИЛЬТРАЦИИ ---
+                        # --- ПРАВИЛО №2: ФИЛЬТР COINGECKO ---
                         if not cg_id:
-                            # Если нет ID, ждем триггера
                             if not is_triggered:
                                 stats['trash'] += 1
                                 continue
                             
-                            # Произошел ПАМП/ДАМП! Делаем запасной запрос в CoinGecko
                             cg_id = await check_coingecko_listing(session, addr, network)
-                            
                             if cg_id:
                                 stats['cg_api_hits'] += 1
                             else:
                                 stats['trash'] += 1
-                                continue # Жестко в мусор, ликвидность игнорируем
+                                continue 
                         else:
-                            # Если ID есть сразу, но нет триггера - просто считаем и идем дальше
                             if not is_triggered:
                                 stats['passed'] += 1
                                 continue
@@ -171,12 +171,11 @@ async def check_markets(session, network):
                         await asyncio.sleep(SETTINGS['tg_pause'])
                     except: continue
             
-            # Пауза 2.5 секунды, чтобы не словить бан при 30 страницах
             await asyncio.sleep(2.5) 
         except Exception as e:
             print(f"❌ Ошибка: {e}"); break
             
-    print(f"📊 {network}: Проверено (с ID): {stats['passed']} | Мусор (без ID): {stats['trash']} | Найдено через API: {stats['cg_api_hits']} | Сигналы: {stats['signals']}")
+    print(f"📊 {network}: Проверено (с ID): {stats['passed']} | Мусор (без ID/Ликв): {stats['trash']} | Сигналы: {stats['signals']}")
 
 async def handle_cmds():
     offset = 0
@@ -193,14 +192,15 @@ async def handle_cmds():
                         txt = msg.get('text', '')
                         
                         if txt == '/start':
-                            await send_tg(sess, f"🤖 <b>Pro Scanner (Deep Scan + Trending)</b>\n\n"
+                            await send_tg(sess, f"🤖 <b>Pro Scanner (Trends + Liq)</b>\n\n"
                                                f"🏆 ТОП-6 (P/D): <b>{SETTINGS['top_pump']}%</b> / <b>-{SETTINGS['top_dump']}%</b>\n"
                                                f"💎 Редкие (P/D): <b>{SETTINGS['rare_pump']}%</b> / <b>-{SETTINGS['rare_dump']}%</b>\n"
-                                               f"⏳ H1 Дамп: <b>-{SETTINGS['h1_dump']}%</b>\n\n"
+                                               f"⏳ H1 Дамп: <b>-{SETTINGS['h1_dump']}%</b>\n"
+                                               f"💧 Мин. ликвидность: <b>${SETTINGS['min_liq']:,.0f}</b>\n\n"
                                                "<b>Команды:</b>\n"
                                                "/pump_top [ч] | /dump_top [ч]\n"
                                                "/pump_rare [ч] | /dump_rare [ч]\n"
-                                               "/dump_h1 [ч]")
+                                               "/dump_h1 [ч] | /min_liq [ч]")
                         elif txt.startswith('/'):
                             parts = txt.split()
                             if len(parts) == 2:
@@ -211,6 +211,7 @@ async def handle_cmds():
                                     elif '/pump_rare' in txt: SETTINGS['rare_pump'] = val
                                     elif '/dump_rare' in txt: SETTINGS['rare_dump'] = val
                                     elif '/dump_h1' in txt: SETTINGS['h1_dump'] = val
+                                    elif '/min_liq' in txt: SETTINGS['min_liq'] = val
                                     await send_tg(sess, f"✅ Обновлено: {val}")
                                 except: pass
             except: pass
