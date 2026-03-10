@@ -12,10 +12,10 @@ SETTINGS = {
     'rare_pump': 20.0,
     'rare_dump': 20.0,
     'h1_dump': 25.0,
-    'min_liq': 10000.0,    # ФИЛЬТР ЛИКВИДНОСТИ ВКЛЮЧЕН ($10,000)
+    'min_liq': 10000.0,    # ФИЛЬТР ЛИКВИДНОСТИ ($10,000)
     'cooldown': 3600,      # 1 час молчания для дубликатов
     'api_pause': 2.3,      # Пауза между страницами
-    'tg_pause': 1.5,       # Пауза между отправками в ТГ
+    'tg_pause': 1.5,       # Пауза между отправками
     'request_timeout': 15  # Таймаут запросов
 }
 
@@ -28,7 +28,6 @@ if not TG_BOT_TOKEN or not TG_CHAT_ID:
 TOP_CHAINS = ['eth', 'bsc', 'polygon', 'arbitrum', 'base', 'solana']
 sent_signals = {}
 
-# Правильные названия сетей для API CoinGecko
 CG_NETWORKS = {
     'eth': 'ethereum', 'bsc': 'binance-smart-chain', 
     'polygon_pos': 'polygon-pos', 'arbitrum': 'arbitrum-one', 
@@ -37,10 +36,10 @@ CG_NETWORKS = {
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Arbitrage Pro (Deep Scan + Correct Addresses + Liq) Active"
+def home(): return "Arbitrage Pro (Strict Base Token Filter) Active"
 
 async def check_coingecko_listing(session, token_address, network):
-    """Прямой запрос к CG по контракту ТОКЕНА (с защитой от бана)"""
+    """Прямой запрос к CG по контракту ИМЕННО ТОКЕНА"""
     if not token_address: return None
     cg_net = CG_NETWORKS.get(network, network)
     url = f"https://api.coingecko.com/api/v3/coins/{cg_net}/contract/{token_address}"
@@ -51,9 +50,7 @@ async def check_coingecko_listing(session, token_address, network):
                 data = await resp.json()
                 return data.get('id')
             elif resp.status == 429:
-                print(f"⚠️ Лимит CoinGecko API! Пауза 10 сек перед повтором...")
-                await asyncio.sleep(10)
-                # Повторяем запрос один раз после паузы
+                await asyncio.sleep(10) # Пауза при бане
                 async with session.get(url, timeout=5) as retry_resp:
                     if retry_resp.status == 200:
                         data = await retry_resp.json()
@@ -103,10 +100,10 @@ async def check_markets(session, network):
     stats = {'passed': 0, 'trash': 0, 'signals': 0, 'cg_api_hits': 0}
     now = time.time()
 
-    # Берем тренды и 30 страниц, подтягиваем ОБА токена из пула
-    urls_to_check = [f"https://api.geckoterminal.com/api/v2/networks/{network}/trending_pools?include=base_token,quote_token"]
+    # Берем ТОЛЬКО base_token, чтобы избежать ловушки с SOL/BNB/USDT
+    urls_to_check = [f"https://api.geckoterminal.com/api/v2/networks/{network}/trending_pools?include=base_token"]
     for page in range(1, 31): 
-        urls_to_check.append(f"https://api.geckoterminal.com/api/v2/networks/{network}/pools?page={page}&include=base_token,quote_token")
+        urls_to_check.append(f"https://api.geckoterminal.com/api/v2/networks/{network}/pools?page={page}&include=base_token")
     
     for url in urls_to_check:
         try:
@@ -124,27 +121,22 @@ async def check_markets(session, network):
                 for p in pools:
                     try:
                         attrs = p.get('attributes', {})
-                        pool_addr = attrs.get('address') # Адрес пула (для ссылок)
+                        pool_addr = attrs.get('address')
                         liq = float(attrs.get('reserve_in_usd') or 0)
                         
-                        # --- ПРАВИЛО №1: ЛИКВИДНОСТЬ ---
+                        # --- 1. ЛИКВИДНОСТЬ ---
                         if liq < min_liq:
                             stats['trash'] += 1
                             continue
                             
-                        # Вытаскиваем оба токена
+                        # --- 2. СТРОГО БАЗОВЫЙ ТОКЕН ---
                         rels = p.get('relationships', {})
                         base_id = rels.get('base_token', {}).get('data', {}).get('id')
-                        quote_id = rels.get('quote_token', {}).get('data', {}).get('id')
-                        
                         base_attrs = tokens.get(base_id, {})
-                        quote_attrs = tokens.get(quote_id, {})
                         
-                        # Ищем ID в любом из токенов
-                        cg_id = base_attrs.get('coingecko_coin_id') or quote_attrs.get('coingecko_coin_id')
-                        
-                        # Адрес контракта монеты (пробуем base, если нет - quote)
-                        token_addr = base_attrs.get('address') or quote_attrs.get('address')
+                        # Ищем ID ИМЕННО у нужной монеты
+                        cg_id = base_attrs.get('coingecko_coin_id')
+                        token_addr = base_attrs.get('address')
                         
                         pct = attrs.get('price_change_percentage') or {}
                         m5, h1, h24 = float(pct.get('m5') or 0), float(pct.get('h1') or 0), float(pct.get('h24') or 0)
@@ -153,19 +145,17 @@ async def check_markets(session, network):
                         is_h1 = (h1 <= -h1_th) and (h24 <= (h1 * 0.8))
                         is_triggered = is_p or is_d or is_h1
                         
-                        # --- ПРАВИЛО №2: ФИЛЬТР COINGECKO ---
+                        # --- 3. ПРОВЕРКА COINGECKO ---
                         if not cg_id:
                             if not is_triggered:
                                 stats['trash'] += 1
                                 continue
                             
-                            # Произошел триггер! Делаем запасной запрос по КОНТРАКТУ ТОКЕНА
-                            print(f"🔍 Запрос в CG для токена {token_addr}...")
+                            # Проверяем напрямую по контракту БАЗОВОГО токена
                             cg_id = await check_coingecko_listing(session, token_addr, network)
                             
                             if cg_id:
                                 stats['cg_api_hits'] += 1
-                                print(f"✅ Найден скрытый ID: {cg_id}")
                             else:
                                 stats['trash'] += 1
                                 continue 
@@ -222,7 +212,7 @@ async def handle_cmds():
                         txt = msg.get('text', '')
                         
                         if txt == '/start':
-                            await send_tg(sess, f"🤖 <b>Pro Scanner (Correct Addr + Liq)</b>\n\n"
+                            await send_tg(sess, f"🤖 <b>Pro Scanner (Fix Base Token)</b>\n\n"
                                                f"🏆 ТОП-6 (P/D): <b>{SETTINGS['top_pump']}%</b> / <b>-{SETTINGS['top_dump']}%</b>\n"
                                                f"💎 Редкие (P/D): <b>{SETTINGS['rare_pump']}%</b> / <b>-{SETTINGS['rare_dump']}%</b>\n"
                                                f"⏳ H1 Дамп: <b>-{SETTINGS['h1_dump']}%</b>\n"
@@ -269,4 +259,4 @@ if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
     srv = Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True)
     srv.start()
-    asyncio.run(main_loop())                                       
+    asyncio.run(main_loop())            
