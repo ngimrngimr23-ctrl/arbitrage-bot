@@ -16,9 +16,9 @@ SETTINGS = {
     'h1_dump': 25.0,
     'min_liq': 10000.0,    
     'cooldown': 3600,      
-    'api_pause': 3.0,      # Вернули нормальную скорость, так как теперь 1000 IP
+    'api_pause': 0.5,      # <--- ТУРБО-РЕЖИМ: пауза всего полсекунды
     'tg_pause': 1.5,       
-    'request_timeout': 15  
+    'request_timeout': 10  # <--- Не ждем тупящие прокси больше 10 секунд
 }
 
 # --- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ---
@@ -52,13 +52,12 @@ IGNORE_SYMBOLS = ['usdt', 'usdc', 'weth', 'wbnb', 'wsol', 'wbtc', 'wpol', 'wmati
 app = Flask(__name__)
 @app.route('/')
 def home(): 
-    status = "Proxy Pool Enabled (1000 IPs)" if PROXY_URL else "Direct Connection"
+    status = "Proxy Pool Enabled (TURBO 1000 IPs)" if PROXY_URL else "Direct Connection"
     return f"Arbitrage Pro Active ({status})"
 
 def get_rotating_proxy():
     """Случайно выбирает 1 из 1000 портов для каждого запроса"""
     if not PROXY_URL: return None
-    # Если это прокси с пулом портов, меняем последнюю цифру на случайную от 10000 до 10999
     if "pool.proxy.market" in PROXY_URL:
         return re.sub(r':\d+$', f':{random.randint(10000, 10999)}', PROXY_URL)
     return PROXY_URL
@@ -69,14 +68,14 @@ async def check_coingecko_listing(session, token_address, network):
     url = f"https://api.coingecko.com/api/v3/coins/{cg_net}/contract/{token_address}"
     try:
         current_proxy = get_rotating_proxy()
-        async with session.get(url, timeout=5, proxy=current_proxy) as resp:
+        async with session.get(url, timeout=SETTINGS['request_timeout'], proxy=current_proxy) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 return data.get('id')
             elif resp.status == 429:
-                await asyncio.sleep(5) 
-                current_proxy = get_rotating_proxy() # Берем новый IP для второй попытки
-                async with session.get(url, timeout=5, proxy=current_proxy) as retry_resp:
+                await asyncio.sleep(1) # Ускорили смену IP
+                current_proxy = get_rotating_proxy() 
+                async with session.get(url, timeout=SETTINGS['request_timeout'], proxy=current_proxy) as retry_resp:
                     if retry_resp.status == 200:
                         data = await retry_resp.json()
                         return data.get('id')
@@ -108,7 +107,7 @@ async def get_all_networks(session):
                 data = await resp.json()
                 for net in data.get('data', []):
                     all_nets.append(net['id'])
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
         except: break
     for top in TOP_CHAINS:
         if top not in all_nets: all_nets.append(top)
@@ -120,7 +119,7 @@ async def check_markets(session, network):
     d_th = SETTINGS['top_dump'] if is_top else SETTINGS['rare_dump']
     min_liq = SETTINGS['min_liq']
     
-    proxy_msg = "(Пул 1000 IP)" if PROXY_URL else ""
+    proxy_msg = "(Пул 1000 IP - ТУРБО)" if PROXY_URL else ""
     print(f"\n📡 СКАНИРУЮ: {network.upper()} {proxy_msg}")
     
     headers = {'User-Agent': 'Mozilla/5.0'}
@@ -134,12 +133,12 @@ async def check_markets(session, network):
     for url in urls_to_check:
         retries = 3
         while retries > 0:
-            current_proxy = get_rotating_proxy() # МЕНЯЕМ IP ПЕРЕД КАЖДЫМ ЗАПРОСОМ
+            current_proxy = get_rotating_proxy() 
             try:
                 async with session.get(url, headers=headers, timeout=SETTINGS['request_timeout'], proxy=current_proxy) as resp:
                     if resp.status == 429:
-                        print(f"🛑 БАН 429 на IP. Меняем порт и повторяем (попытка {4-retries}/3)...")
-                        await asyncio.sleep(2) # Пауза маленькая, так как мы сейчас сменим IP
+                        print(f"⚡ БАН 429. Мгновенная смена IP (осталось попыток: {retries-1})...")
+                        await asyncio.sleep(0.5) # Почти нулевая задержка
                         retries -= 1
                         continue 
                     
@@ -229,8 +228,7 @@ async def check_markets(session, network):
                         except: continue
                     break 
             except Exception as e:
-                # print(f"❌ Сбой IP: пробуем другой порт...") # Закомментировано, чтобы не спамить логи
-                await asyncio.sleep(2) 
+                await asyncio.sleep(0.5) # Если прокси отвалился, не ждем, берем следующий
                 retries -= 1
         await asyncio.sleep(SETTINGS['api_pause']) 
             
@@ -251,8 +249,8 @@ async def handle_cmds():
                         txt = msg.get('text', '')
                         
                         if txt == '/start':
-                            status = "ВКЛЮЧЕН ✅ (1000 IPs)" if PROXY_URL else "ВЫКЛЮЧЕН ❌"
-                            await send_tg(sess, f"🤖 <b>Pro Scanner (Анти-Бан + Proxy Pool)</b>\n\n"
+                            status = "ВКЛЮЧЕН ✅ (1000 IPs TURBO)" if PROXY_URL else "ВЫКЛЮЧЕН ❌"
+                            await send_tg(sess, f"🤖 <b>Pro Scanner (TURBO + Proxy Pool)</b>\n\n"
                                                f"🏆 ТОП-6: <b>{SETTINGS['top_pump']}%</b> / <b>-{SETTINGS['top_dump']}%</b>\n"
                                                f"💎 Редкие: <b>{SETTINGS['rare_pump']}%</b> / <b>-{SETTINGS['rare_dump']}%</b>\n"
                                                f"💧 Мин. ликвидность: <b>${SETTINGS['min_liq']:,.0f}</b>\n"
@@ -278,7 +276,7 @@ async def handle_cmds():
 
 async def main_loop():
     asyncio.create_task(handle_cmds())
-    conn = aiohttp.TCPConnector(limit=10)
+    conn = aiohttp.TCPConnector(limit=20) # Увеличили лимит одновременных подключений
     async with aiohttp.ClientSession(connector=conn) as sess:
         while True:
             nets = await get_all_networks(sess)
@@ -291,11 +289,11 @@ async def main_loop():
             to_del = [k for k, v in sent_signals.items() if (cur - v) > SETTINGS['cooldown']]
             for k in to_del: del sent_signals[k]
             
-            print("🏁 КРУГ ЗАВЕРШЕН. Отдыхаем 30 секунд...")
-            await asyncio.sleep(30)
+            print("🏁 КРУГ ЗАВЕРШЕН. Отдыхаем 15 секунд...") # Уменьшили паузу между кругами
+            await asyncio.sleep(15)
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
     srv = Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True)
     srv.start()
-    asyncio.run(main_loop())   
+    asyncio.run(main_loop())
