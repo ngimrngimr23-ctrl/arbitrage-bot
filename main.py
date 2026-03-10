@@ -12,18 +12,27 @@ SETTINGS = {
     'rare_pump': 20.0,
     'rare_dump': 20.0,
     'h1_dump': 25.0,
-    'min_liq': 10000.0,    # Фильтр ликвидности ($10,000)
-    'cooldown': 3600,      # 1 час молчания для дубликатов
-    'api_pause': 2.5,      # Пауза между страницами
-    'tg_pause': 1.5,       # Пауза между сообщениями в ТГ
-    'request_timeout': 15  # Секунд на ожидание ответа
+    'min_liq': 10000.0,    
+    'cooldown': 3600,      
+    'api_pause': 2.5,      
+    'tg_pause': 1.5,       
+    'request_timeout': 15  
 }
 
 # --- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ---
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN')
 TG_CHAT_ID = os.environ.get('TG_CHAT_ID')
-# Сюда Render подтянет твой прокси (формат: http://user:pass@ip:port)
-PROXY_URL = os.environ.get('PROXY_URL')
+
+# Автоматическая починка прокси (если Render не сохранил http://)
+raw_proxy = os.environ.get('PROXY_URL')
+if raw_proxy:
+    raw_proxy = raw_proxy.strip()
+    if not raw_proxy.startswith('http'):
+        PROXY_URL = f"http://{raw_proxy}"
+    else:
+        PROXY_URL = raw_proxy
+else:
+    PROXY_URL = None
 
 if not TG_BOT_TOKEN or not TG_CHAT_ID:
     raise ValueError("❌ КРИТИЧЕСКАЯ ОШИБКА: Проверь переменные окружения (TG_BOT_TOKEN, TG_CHAT_ID)!")
@@ -37,7 +46,7 @@ CG_NETWORKS = {
     'base': 'base', 'solana': 'solana'
 }
 
-# Черный список: Игнорируем стейблы и обернутые токены
+# Игнорируем стейблы и обернутые токены
 IGNORE_SYMBOLS = ['usdt', 'usdc', 'weth', 'wbnb', 'wsol', 'wbtc', 'wpol', 'wmatic', 'dai', 'fdusd']
 
 app = Flask(__name__)
@@ -47,18 +56,16 @@ def home():
     return f"Arbitrage Pro Active ({status})"
 
 async def check_coingecko_listing(session, token_address, network):
-    """Прямой запрос в CoinGecko с защитой от бана и поддержкой Proxy"""
     if not token_address: return None
     cg_net = CG_NETWORKS.get(network, network)
     url = f"https://api.coingecko.com/api/v3/coins/{cg_net}/contract/{token_address}"
     try:
-        # Прокидываем PROXY_URL в запрос, если он есть
         async with session.get(url, timeout=5, proxy=PROXY_URL) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 return data.get('id')
             elif resp.status == 429:
-                await asyncio.sleep(10) # Пауза при бане CoinGecko
+                await asyncio.sleep(10) 
                 async with session.get(url, timeout=5, proxy=PROXY_URL) as retry_resp:
                     if retry_resp.status == 200:
                         data = await retry_resp.json()
@@ -85,7 +92,6 @@ async def get_all_networks(session):
     for page in range(1, 5):
         url = f"https://api.geckoterminal.com/api/v2/networks?page={page}"
         try:
-            # Для сетей прокси не так критичен, но можно использовать
             async with session.get(url, headers=headers, timeout=SETTINGS['request_timeout'], proxy=PROXY_URL) as resp:
                 if resp.status != 200: break
                 data = await resp.json()
@@ -118,13 +124,12 @@ async def check_markets(session, network):
         retries = 3
         while retries > 0:
             try:
-                # ГЛАВНЫЙ ЗАПРОС С ПОДДЕРЖКОЙ ПРОКСИ
                 async with session.get(url, headers=headers, timeout=SETTINGS['request_timeout'], proxy=PROXY_URL) as resp:
                     if resp.status == 429:
                         print(f"🛑 БАН 429. Ждем 20 сек (попытка {4-retries}/3)...")
                         await asyncio.sleep(20)
                         retries -= 1
-                        continue # Продолжаем пытаться загрузить эту же страницу
+                        continue 
                     
                     if resp.status != 200: break
                     
@@ -138,13 +143,13 @@ async def check_markets(session, network):
                             attrs = p.get('attributes', {})
                             pool_addr = attrs.get('address')
                             liq = float(attrs.get('reserve_in_usd') or 0)
+                            name_lower = attrs.get('name', '').lower()
                             
-                            # 1. ЛИКВИДНОСТЬ
-                            if liq < min_liq:
+                            # Жесткий фильтр от мусора и кредитных токенов
+                            if liq < min_liq or any(word in name_lower for word in ['loan', 'lend', 'credit', 'borrow']):
                                 stats['trash'] += 1
                                 continue
                                 
-                            # 2. ИСКЛЮЧАЕМ СТЕЙБЛЫ И ОБЕРТКИ
                             rels = p.get('relationships', {})
                             b_id = rels.get('base_token', {}).get('data', {}).get('id')
                             q_id = rels.get('quote_token', {}).get('data', {}).get('id')
@@ -165,13 +170,12 @@ async def check_markets(session, network):
                             cg_id = target_attrs.get('coingecko_coin_id')
                             token_addr = target_attrs.get('address')
                             
-                            # 3. ПРОВЕРКА ГРАФИКА
                             pct = attrs.get('price_change_percentage') or {}
                             m5 = float(pct.get('m5') or 0)
                             
+                            # Прострелы и вверх, и вниз
                             is_triggered = abs(m5) >= min(p_th, d_th) 
                             
-                            # 4. ПРОВЕРКА COINGECKO
                             if not cg_id:
                                 if not is_triggered:
                                     stats['trash'] += 1
@@ -191,7 +195,6 @@ async def check_markets(session, network):
                             
                             stats['passed'] += 1
                             
-                            # --- ОТПРАВКА СИГНАЛА ---
                             type_sig = "V5"
                             key = f"{network}_{pool_addr}_{type_sig}"
                             
@@ -214,10 +217,10 @@ async def check_markets(session, network):
                             await send_tg(session, msg)
                             await asyncio.sleep(SETTINGS['tg_pause'])
                         except: continue
-                    break # Страница успешно загружена, выходим из цикла ретраев
+                    break 
             except Exception as e:
                 print(f"❌ Ошибка загрузки URL: {e}")
-                await asyncio.sleep(5) # Короткая пауза при сбое сети/прокси
+                await asyncio.sleep(5) 
                 retries -= 1
         await asyncio.sleep(SETTINGS['api_pause']) 
             
@@ -229,7 +232,6 @@ async def handle_cmds():
         while True:
             url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getUpdates?offset={offset}&timeout=10"
             try:
-                # Телеграм не банит, прокси тут не нужен
                 async with sess.get(url, timeout=SETTINGS['request_timeout']) as resp:
                     data = await resp.json()
                     for up in data.get('result', []):
@@ -266,7 +268,6 @@ async def handle_cmds():
 
 async def main_loop():
     asyncio.create_task(handle_cmds())
-    # Ограничиваем количество одновременных соединений для стабильности
     conn = aiohttp.TCPConnector(limit=10)
     async with aiohttp.ClientSession(connector=conn) as sess:
         while True:
@@ -287,4 +288,4 @@ if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
     srv = Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True)
     srv.start()
-    asyncio.run(main_loop()) 
+    asyncio.run(main_loop())    
