@@ -2,6 +2,8 @@ import asyncio
 import aiohttp
 import os
 import time
+import random
+import re
 from flask import Flask
 from threading import Thread
 
@@ -14,16 +16,15 @@ SETTINGS = {
     'h1_dump': 25.0,
     'min_liq': 10000.0,    
     'cooldown': 3600,      
-    'api_pause': 6.0,      # <--- ЗАМЕДЛИЛИ БОТА ДО 6 СЕКУНД (Стелс-режим)
+    'api_pause': 3.0,      # Вернули нормальную скорость, так как теперь 1000 IP
     'tg_pause': 1.5,       
-    'request_timeout': 20  # <--- ДАЛИ РЕЗИДЕНТНЫМ ПРОКСИ БОЛЬШЕ ВРЕМЕНИ НА ОТВЕТ
+    'request_timeout': 15  
 }
 
 # --- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ---
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN')
 TG_CHAT_ID = os.environ.get('TG_CHAT_ID')
 
-# Автоматическая починка прокси (если Render не сохранил http://)
 raw_proxy = os.environ.get('PROXY_URL')
 if raw_proxy:
     raw_proxy = raw_proxy.strip()
@@ -46,27 +47,36 @@ CG_NETWORKS = {
     'base': 'base', 'solana': 'solana'
 }
 
-# Игнорируем стейблы и обернутые токены
 IGNORE_SYMBOLS = ['usdt', 'usdc', 'weth', 'wbnb', 'wsol', 'wbtc', 'wpol', 'wmatic', 'dai', 'fdusd']
 
 app = Flask(__name__)
 @app.route('/')
 def home(): 
-    status = "Proxy Enabled (Stealth Mode)" if PROXY_URL else "Direct Connection"
+    status = "Proxy Pool Enabled (1000 IPs)" if PROXY_URL else "Direct Connection"
     return f"Arbitrage Pro Active ({status})"
+
+def get_rotating_proxy():
+    """Случайно выбирает 1 из 1000 портов для каждого запроса"""
+    if not PROXY_URL: return None
+    # Если это прокси с пулом портов, меняем последнюю цифру на случайную от 10000 до 10999
+    if "pool.proxy.market" in PROXY_URL:
+        return re.sub(r':\d+$', f':{random.randint(10000, 10999)}', PROXY_URL)
+    return PROXY_URL
 
 async def check_coingecko_listing(session, token_address, network):
     if not token_address: return None
     cg_net = CG_NETWORKS.get(network, network)
     url = f"https://api.coingecko.com/api/v3/coins/{cg_net}/contract/{token_address}"
     try:
-        async with session.get(url, timeout=5, proxy=PROXY_URL) as resp:
+        current_proxy = get_rotating_proxy()
+        async with session.get(url, timeout=5, proxy=current_proxy) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 return data.get('id')
             elif resp.status == 429:
-                await asyncio.sleep(10) 
-                async with session.get(url, timeout=5, proxy=PROXY_URL) as retry_resp:
+                await asyncio.sleep(5) 
+                current_proxy = get_rotating_proxy() # Берем новый IP для второй попытки
+                async with session.get(url, timeout=5, proxy=current_proxy) as retry_resp:
                     if retry_resp.status == 200:
                         data = await retry_resp.json()
                         return data.get('id')
@@ -92,7 +102,8 @@ async def get_all_networks(session):
     for page in range(1, 5):
         url = f"https://api.geckoterminal.com/api/v2/networks?page={page}"
         try:
-            async with session.get(url, headers=headers, timeout=SETTINGS['request_timeout'], proxy=PROXY_URL) as resp:
+            current_proxy = get_rotating_proxy()
+            async with session.get(url, headers=headers, timeout=SETTINGS['request_timeout'], proxy=current_proxy) as resp:
                 if resp.status != 200: break
                 data = await resp.json()
                 for net in data.get('data', []):
@@ -109,7 +120,7 @@ async def check_markets(session, network):
     d_th = SETTINGS['top_dump'] if is_top else SETTINGS['rare_dump']
     min_liq = SETTINGS['min_liq']
     
-    proxy_msg = "(Через PROXY)" if PROXY_URL else ""
+    proxy_msg = "(Пул 1000 IP)" if PROXY_URL else ""
     print(f"\n📡 СКАНИРУЮ: {network.upper()} {proxy_msg}")
     
     headers = {'User-Agent': 'Mozilla/5.0'}
@@ -123,11 +134,12 @@ async def check_markets(session, network):
     for url in urls_to_check:
         retries = 3
         while retries > 0:
+            current_proxy = get_rotating_proxy() # МЕНЯЕМ IP ПЕРЕД КАЖДЫМ ЗАПРОСОМ
             try:
-                async with session.get(url, headers=headers, timeout=SETTINGS['request_timeout'], proxy=PROXY_URL) as resp:
+                async with session.get(url, headers=headers, timeout=SETTINGS['request_timeout'], proxy=current_proxy) as resp:
                     if resp.status == 429:
-                        print(f"🛑 БАН 429. Ждем 20 сек (попытка {4-retries}/3)...")
-                        await asyncio.sleep(20)
+                        print(f"🛑 БАН 429 на IP. Меняем порт и повторяем (попытка {4-retries}/3)...")
+                        await asyncio.sleep(2) # Пауза маленькая, так как мы сейчас сменим IP
                         retries -= 1
                         continue 
                     
@@ -145,7 +157,6 @@ async def check_markets(session, network):
                             liq = float(attrs.get('reserve_in_usd') or 0)
                             name_lower = attrs.get('name', '').lower()
                             
-                            # Жесткий фильтр от мусора и кредитных токенов
                             if liq < min_liq or any(word in name_lower for word in ['loan', 'lend', 'credit', 'borrow']):
                                 stats['trash'] += 1
                                 continue
@@ -173,7 +184,6 @@ async def check_markets(session, network):
                             pct = attrs.get('price_change_percentage') or {}
                             m5 = float(pct.get('m5') or 0)
                             
-                            # Прострелы и вверх, и вниз
                             is_triggered = abs(m5) >= min(p_th, d_th) 
                             
                             if not cg_id:
@@ -219,8 +229,8 @@ async def check_markets(session, network):
                         except: continue
                     break 
             except Exception as e:
-                print(f"❌ Ошибка загрузки URL: {e}")
-                await asyncio.sleep(10) # Увеличили паузу при ошибке прокси
+                # print(f"❌ Сбой IP: пробуем другой порт...") # Закомментировано, чтобы не спамить логи
+                await asyncio.sleep(2) 
                 retries -= 1
         await asyncio.sleep(SETTINGS['api_pause']) 
             
@@ -241,8 +251,8 @@ async def handle_cmds():
                         txt = msg.get('text', '')
                         
                         if txt == '/start':
-                            status = "ВКЛЮЧЕН ✅ (Стелс)" if PROXY_URL else "ВЫКЛЮЧЕН ❌"
-                            await send_tg(sess, f"🤖 <b>Pro Scanner (Анти-Бан + Proxy)</b>\n\n"
+                            status = "ВКЛЮЧЕН ✅ (1000 IPs)" if PROXY_URL else "ВЫКЛЮЧЕН ❌"
+                            await send_tg(sess, f"🤖 <b>Pro Scanner (Анти-Бан + Proxy Pool)</b>\n\n"
                                                f"🏆 ТОП-6: <b>{SETTINGS['top_pump']}%</b> / <b>-{SETTINGS['top_dump']}%</b>\n"
                                                f"💎 Редкие: <b>{SETTINGS['rare_pump']}%</b> / <b>-{SETTINGS['rare_dump']}%</b>\n"
                                                f"💧 Мин. ликвидность: <b>${SETTINGS['min_liq']:,.0f}</b>\n"
@@ -288,4 +298,4 @@ if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
     srv = Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True)
     srv.start()
-    asyncio.run(main_loop()) 
+    asyncio.run(main_loop())   
