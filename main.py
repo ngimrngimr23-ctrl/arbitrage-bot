@@ -14,9 +14,9 @@ SETTINGS = {
     'h1_dump': 25.0,
     'min_liq': 10000.0,    
     'cooldown': 3600,      
-    'api_pause': 2.5,      
+    'api_pause': 6.0,      # <--- ЗАМЕДЛИЛИ БОТА ДО 6 СЕКУНД (Стелс-режим)
     'tg_pause': 1.5,       
-    'request_timeout': 15  
+    'request_timeout': 20  # <--- ДАЛИ РЕЗИДЕНТНЫМ ПРОКСИ БОЛЬШЕ ВРЕМЕНИ НА ОТВЕТ
 }
 
 # --- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ---
@@ -52,7 +52,7 @@ IGNORE_SYMBOLS = ['usdt', 'usdc', 'weth', 'wbnb', 'wsol', 'wbtc', 'wpol', 'wmati
 app = Flask(__name__)
 @app.route('/')
 def home(): 
-    status = "Proxy Enabled" if PROXY_URL else "Direct Connection"
+    status = "Proxy Enabled (Stealth Mode)" if PROXY_URL else "Direct Connection"
     return f"Arbitrage Pro Active ({status})"
 
 async def check_coingecko_listing(session, token_address, network):
@@ -220,7 +220,7 @@ async def check_markets(session, network):
                     break 
             except Exception as e:
                 print(f"❌ Ошибка загрузки URL: {e}")
-                await asyncio.sleep(5) 
+                await asyncio.sleep(10) # Увеличили паузу при ошибке прокси
                 retries -= 1
         await asyncio.sleep(SETTINGS['api_pause']) 
             
@@ -241,7 +241,7 @@ async def handle_cmds():
                         txt = msg.get('text', '')
                         
                         if txt == '/start':
-                            status = "ВКЛЮЧЕН ✅" if PROXY_URL else "ВЫКЛЮЧЕН ❌"
+                            status = "ВКЛЮЧЕН ✅ (Стелс)" if PROXY_URL else "ВЫКЛЮЧЕН ❌"
                             await send_tg(sess, f"🤖 <b>Pro Scanner (Анти-Бан + Proxy)</b>\n\n"
                                                f"🏆 ТОП-6: <b>{SETTINGS['top_pump']}%</b> / <b>-{SETTINGS['top_dump']}%</b>\n"
                                                f"💎 Редкие: <b>{SETTINGS['rare_pump']}%</b> / <b>-{SETTINGS['rare_dump']}%</b>\n"
@@ -288,4 +288,4 @@ if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
     srv = Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True)
     srv.start()
-    asyncio.run(main_loop())    
+    asyncio.run(main_loop()) 
