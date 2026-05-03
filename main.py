@@ -3,12 +3,12 @@ import asyncio
 import json
 import os
 import urllib.parse
+from aiohttp import web
 
-# Настройки из Environment Variables
+# Настройки
 API_TOKEN = os.environ.get("GIFT_SATELLITE_TOKEN")
 BASE_URL = "https://gift-satellite.dev/api"
 
-# Список всех коллекций
 ALL_COLLECTIONS = [
     "Heart Locket", "Plush Pepe", "Heroic Helmet", "Mighty Arm", "Ion Gem", 
     "Durov's Cap", "Nail Bracelet", "Perfume Bottle", "Magic Potion", "Mini Oscar", 
@@ -33,8 +33,22 @@ ALL_COLLECTIONS = [
     "Westside Sign", "Khabib's Papakha"
 ]
 
+# --- ЗАГЛУШКА ДЛЯ РЕНДЕРА ---
+async def handle_ping(request):
+    return web.Response(text="OK")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"🌐 Веб-сервер запущен (Рендер больше не ругается)")
+
+# --- ОСНОВНОЙ ПАРСЕР ---
 async def fetch_prices(session, market, coll):
-    # Кодируем название, чтобы не было ошибки 400
     safe_coll = urllib.parse.quote(coll)
     url = f"{BASE_URL}/search/{market}/{safe_coll}?limit=1000"
     headers = {"Authorization": f"Token {API_TOKEN}"}
@@ -43,7 +57,6 @@ async def fetch_prices(session, market, coll):
         async with session.get(url, headers=headers, timeout=15) as r:
             if r.status == 200:
                 data = await r.json()
-                # Извлекаем список предметов
                 items = data if isinstance(data, list) else (data.get("data") or [])
                 return items
             elif r.status == 429:
@@ -53,7 +66,9 @@ async def fetch_prices(session, market, coll):
     return []
 
 async def main():
-    # 3 площадки для анализа
+    # Запускаем сервер-пустышку в первую очередь
+    await start_web_server()
+
     markets = ["tg", "mrkt", "portals"]
     final_data = {}
 
@@ -66,7 +81,6 @@ async def main():
             for mkt in markets:
                 res = await fetch_prices(session, mkt, coll)
                 
-                # Если поймали лимит — ждем
                 if res == "RATE_LIMIT":
                     print(f"⏳ Лимит на {mkt}, жду 5 секунд...")
                     await asyncio.sleep(5)
@@ -79,23 +93,25 @@ async def main():
                         
                         if model and price > 0:
                             model = str(model).strip()
-                            # Оставляем только самую низкую цену для этой модели
                             if model not in coll_min_prices or price < coll_min_prices[model]:
                                 coll_min_prices[model] = price
                 
-                # Пауза между запросами к площадкам
                 await asyncio.sleep(2)
             
             if coll_min_prices:
                 final_data[coll] = coll_min_prices
                 print(f"✅ {coll}: данные собраны.")
             
-            # Пауза перед следующей коллекцией
             await asyncio.sleep(1)
 
     print("\n================ ФИНАЛЬНАЯ ВЫЖИМКА (MIN PRICES) ================")
     print(json.dumps(final_data, indent=2, ensure_ascii=False))
     print("================ КОНЕЦ ДАННЫХ ================")
+    
+    # Чтобы Рендер не перезапускал скрипт после завершения, просто спим
+    print("💤 Сбор завершен, ухожу в спящий режим.")
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     asyncio.run(main())
