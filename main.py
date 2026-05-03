@@ -2,16 +2,19 @@ import aiohttp
 import asyncio
 import json
 import os
+import urllib.parse # <-- Добавили парсер ссылок
 
-# Render сам подтянет твой токен из переменных окружения (Environment Variables)
 API_TOKEN = os.environ.get("GIFT_SATELLITE_TOKEN")
 BASE_URL = "https://gift-satellite.dev/api"
 
 async def main():
-    url = f"{BASE_URL}/search/tg/Durov's Cap?limit=1"
+    # Правильно кодируем название коллекции для URL
+    collection_name = urllib.parse.quote("Durov's Cap")
+    url = f"{BASE_URL}/search/tg/{collection_name}?limit=1"
+    
     headers = {"Authorization": f"Token {API_TOKEN}"}
     
-    print("🚀 Запускаем тестовый запрос к API...")
+    print(f"🚀 Стучимся по ссылке: {url}")
     
     async with aiohttp.ClientSession() as session:
         try:
@@ -25,4 +28,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
